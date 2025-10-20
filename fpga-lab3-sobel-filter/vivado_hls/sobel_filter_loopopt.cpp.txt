@@ -1,0 +1,125 @@
+// sobel_filter_opt_loops.cpp
+#include "sobel_filter.h"
+#include <ap_int.h>
+
+// Clamp 12-bit magnitude back to 8-bit pixel
+static inline pix_t clip8(mag_t v) {
+    return (v > 255) ? (pix_t)255 : (pix_t)v;
+}
+
+// Loop-optimized Sobel: unrolling + fusion (+ tiny split for prologue)
+void sobel_filter(const pix_t in[IMG_SIZE], pix_t out[IMG_SIZE]) {
+#pragma HLS INLINE off
+
+    // --- Sliding state ---
+    // 3 line-buffers to hold previous rows (row-cyclic indexing)
+    pix_t linebuf[3][IMG_COLS];
+#pragma HLS RESOURCE          variable=linebuf core=RAM_T2P_BRAM
+#pragma HLS ARRAY_PARTITION   variable=linebuf complete dim=1
+
+    // 3x3 window kept fully in registers each cycle
+    pix_t win[3][3];
+#pragma HLS ARRAY_PARTITION   variable=win complete dim=0
+
+    // Initialize line buffers & window (tiny prologue = "loop splitting")
+InitL:
+    for (int c = 0; c < IMG_COLS; ++c) {
+#pragma HLS PIPELINE II=1
+        linebuf[0][c] = 0;
+        linebuf[1][c] = 0;
+        linebuf[2][c] = 0;
+    }
+#pragma HLS ARRAY_PARTITION variable=win complete dim=0
+InitW:
+    for (int i = 0; i < 3; ++i) {
+#pragma HLS UNROLL
+        for (int j = 0; j < 3; ++j) {
+#pragma HLS UNROLL
+            win[i][j] = 0;
+        }
+    }
+
+Row_Loop:
+    for (int r = 0; r < IMG_ROWS; ++r) {
+
+        // Row indices for ring-buffered linebuf
+        const int widx  =  r      % 3;   // row being written this cycle
+        const int p1idx = (r + 2) % 3;   // r-1
+        const int p2idx = (r + 1) % 3;   // r-2
+
+    Col_Loop:
+        for (int c = 0; c < IMG_COLS; ++c) {
+#pragma HLS PIPELINE II=1  // <— primary loop pipelining (throughput driver)
+
+            // ------------------------
+            // Loop fusion: load+window+compute+store in one loop body
+            // ------------------------
+
+            // 1) Shift the 3x3 window left (kept fully partitioned in regs)
+            win[0][0] = win[0][1];  win[0][1] = win[0][2];
+            win[1][0] = win[1][1];  win[1][1] = win[1][2];
+            win[2][0] = win[2][1];  win[2][1] = win[2][2];
+
+            // 2) Read current pixel; fetch two upper pixels from line buffers
+            const pix_t cur = in[r * IMG_COLS + c];
+            const pix_t p1  = (r >= 1) ? linebuf[p1idx][c] : (pix_t)0;  // r-1
+            const pix_t p0  = (r >= 2) ? linebuf[p2idx][c] : (pix_t)0;  // r-2
+
+            // Update line buffer for this column (write newest row)
+            linebuf[widx][c] = cur;
+
+            // 3) Insert new rightmost column into window
+            win[0][2] = p0;
+            win[1][2] = p1;
+            win[2][2] = cur;
+
+            // 4) Default border handling (zero until window valid)
+            pix_t outpix = 0;
+
+            if (r >= 2 && c >= 2) {
+                // 5) Unrolled 3×3 Sobel compute (all 9 taps in parallel)
+                //    Uses adds/shifts for ±1/±2; no DSPs required.
+                grad_t sumx = 0, sumy = 0;
+
+            KI:
+                for (int i = 0; i < 3; ++i) {
+#pragma HLS UNROLL
+                KJ:
+                    for (int j = 0; j < 3; ++j) {
+#pragma HLS UNROLL
+                        const int v = (int)win[i][j];
+                        int gx = 0, gy = 0;
+
+                        // Gx: [-1 0 1; -2 0 2; -1 0 1]
+                        // Gy: [ 1 2 1;  0 0 0; -1 -2 -1]
+                        if (i == 0) { // top row
+                            if (j == 0) { gx -= v; gy += v; }
+                            if (j == 1) {          gy += (v << 1); }
+                            if (j == 2) { gx += v; gy += v; }
+                        } else if (i == 1) { // mid row
+                            if (j == 0) { gx -= (v << 1); }
+                            if (j == 2) { gx += (v << 1); }
+                        } else { // i == 2, bottom row
+                            if (j == 0) { gx -= v; gy -= v; }
+                            if (j == 1) {          gy -= (v << 1); }
+                            if (j == 2) { gx += v; gy -= v; }
+                        }
+
+                        sumx += (grad_t)gx;
+                        sumy += (grad_t)gy;
+                    }
+                }
+
+                // L1 magnitude with your narrower types
+                ap_uint<11> ax = (sumx < 0) ? (ap_uint<11>)(-sumx) : (ap_uint<11>)sumx;
+                ap_uint<11> ay = (sumy < 0) ? (ap_uint<11>)(-sumy) : (ap_uint<11>)sumy;
+                const mag_t mag = (mag_t)ax + (mag_t)ay;
+
+                outpix = clip8(mag);
+            }
+
+            // 6) Store (fused in the same loop)
+            out[r * IMG_COLS + c] = outpix;
+        }
+    }
+}
